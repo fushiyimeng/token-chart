@@ -1,0 +1,4 @@
+*.exe
+__pycache__/
+token-usage.html
+usage_data_*
