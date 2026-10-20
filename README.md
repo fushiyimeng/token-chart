@@ -1,5 +1,10 @@
 # DeepSeek 用量图（token-chart）
 
+**[下载](../../releases/latest)**
+- `token-chart-win-exe.zip` —— Windows 双击就能跑，不用装 Python（推荐）
+- `token-chart-src.zip` —— 源码版，有 Python 用这个
+
+
 把 DeepSeek 平台导出的用量 CSV 合并、按天去重、按月拆成 `data/YYYY-MM.csv`，
 再生成一张单文件网页 `token-usage.html`（数据写在页面里，双击就能看、能转发）。
 
