@@ -1,0 +1,23 @@
+name: build-exe
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyInstaller
+        run: python -m pip install --quiet --upgrade pyinstaller
+      - name: Build exe
+        run: python -m PyInstaller --onefile --name token-chart --distpath . --workpath build/pyi --specpath build/pyi --noconfirm build.py
+      - name: Zip
+        run: Compress-Archive -Path token-chart.exe -DestinationPath token-chart-win-exe.zip -Force
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload v1.2.0 token-chart-win-exe.zip --clobber
