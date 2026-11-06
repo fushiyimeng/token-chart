@@ -107,6 +107,17 @@ def _ref_name(ref) -> str:
     return Path(ref).name
 
 
+def _pairs_in(dirpath: Path, ref: Path) -> list[tuple[Path, Path, Path, float]]:
+    """把目录里所有 amount-*/cost-* 按后缀配成对（一个目录可能有多段窗口）。"""
+    costs = {p.name[len("cost-"):]: p for p in dirpath.glob("cost-*.csv")}
+    out = []
+    for a in sorted(dirpath.glob("amount-*.csv")):
+        c = costs.get(a.name[len("amount-"):])
+        if c:
+            out.append((a, c, ref, max(a.stat().st_mtime, c.stat().st_mtime)))
+    return out
+
+
 def find_sources(argv: list[str]) -> list[tuple[object, object, Path, float]]:
     """找出**所有**数据源，返回 [(amount.csv, cost.csv, 目录, 修改时间)]（旧→新）。
 
@@ -125,20 +136,20 @@ def find_sources(argv: list[str]) -> list[tuple[object, object, Path, float]]:
 
     found: list[tuple[Path, Path, Path, float]] = []
     bases = [HERE, HERE / "data"]        # 只用相对本脚本的目录，搬走也能用
+    # 2026-10-28：懒得拖进来也能用——自动看浏览器下载目录里的平台导出
+    _home = Path.home()
+    for _cand in (_home / "Downloads", _home / "OneDrive" / "Downloads"):
+        if _cand.is_dir() and _cand not in bases:
+            bases.append(_cand)
     for base in bases:
         if not base.is_dir():
             continue
         for d in sorted(base.glob("usage_data_*")):
             if not d.is_dir():
                 continue
-            amt = next(iter(sorted(d.glob("amount-*.csv"))), None)
-            cost = next(iter(sorted(d.glob("cost-*.csv"))), None)
-            if amt and cost:
-                found.append((amt, cost, d, max(amt.stat().st_mtime, cost.stat().st_mtime)))
-        amt = next(iter(sorted(base.glob("amount-*.csv"))), None)
-        cost = next(iter(sorted(base.glob("cost-*.csv"))), None)
-        if amt and cost:
-            found.append((amt, cost, base, max(amt.stat().st_mtime, cost.stat().st_mtime)))
+            # 一个目录里可能有多段窗口（更新脚本按 31 天切），每一对都要吃进来
+            found.extend(_pairs_in(d, d))
+        found.extend(_pairs_in(base, base))
         # 🆕 直接吃平台下载的压缩包（不用解压）
         for z in sorted(base.glob("*.zip")):
             for amt_ref, cost_ref in _zip_pairs(z):
@@ -215,6 +226,8 @@ def _load_grain():
     if not DATA_DIR.is_dir():
         return tok, req, daycost
     for f in sorted(DATA_DIR.glob("*.csv")):
+        if f.name.startswith("cache_stats_"):
+            continue
         with open(f, encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh):
                 d, api, model = row["date"], row["api"], row["model"]
@@ -247,6 +260,8 @@ def _save_grain(tok, req, daycost):
             for r in rows:
                 w.writerow([r[0], r[1], r[2], r[3], "%.6f" % r[4], r[5]])
     for old in DATA_DIR.glob("*.csv"):
+        if old.name.startswith("cache_stats_"):
+            continue
         if old.stem not in months:
             old.unlink(missing_ok=True)
     return sorted(months)
@@ -377,6 +392,45 @@ def _dedup_srcs(sources) -> list[dict]:
             for x in sorted(best.values(), key=lambda y: y["key"])]
 
 
+KEYS_FILE = DATA_DIR / "api_keys.json"
+
+
+def _key_cfg() -> dict:
+    """data/api_keys.json：哪些 key 还在用、显示成什么名字、停用的合并到哪一格。"""
+    try:
+        return json.loads(KEYS_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+
+
+def _display_grain(tok, req, daycost):
+    """不改账本，只改**给页面看**的 key 名：老的/停用的并成一格，在用的加备注。"""
+    cfg = _key_cfg()
+    active = cfg.get("active") or []
+    labels = cfg.get("labels") or {}
+    retired = cfg.get("retired") or "（已停用）"
+    if not active:
+        return tok, req, daycost
+    act = set(active)
+    def name(a):
+        if a in labels:
+            return labels[a]
+        if a in act:
+            return a
+        return retired
+    out_tok = {}
+    for (d, a, m), v in tok.items():
+        k = (d, name(a), m)
+        cur = out_tok.setdefault(k, [0, 0.0])
+        cur[0] += v[0]
+        cur[1] += v[1]
+    out_req = {}
+    for (d, a), n in req.items():
+        k = (d, name(a))
+        out_req[k] = out_req.get(k, 0) + n
+    return out_tok, out_req, daycost
+
+
 def payload() -> dict:
     """现读**所有** CSV → 页面要用的那份 JSON（服务模式下每次刷新都重新算）。"""
     try:
@@ -390,21 +444,44 @@ def payload() -> dict:
     tok = dict(old[0]); tok.update(fresh[0])
     req = dict(old[1]); req.update(fresh[1])
     dc = dict(old[2]); dc.update(fresh[2])
-    _save_grain(tok, req, dc)
-    rows = daily((tok, req, dc))
+    _save_grain(tok, req, dc)          # 账本永远是原始 key 名
+    dtok, dreq, ddc = _display_grain(tok, req, dc)   # 页面显示用映射后的名字
+    rows = daily((dtok, dreq, ddc))
     apis: dict[str, int] = {}
     api_cost: dict[str, float] = {}
+    api_req: dict[str, int] = {}
     for r in rows:
         for k, v in (r.get("byApi") or {}).items():
             apis[k] = apis.get(k, 0) + v
         for k, v in (r.get("byApiCost") or {}).items():
             api_cost[k] = api_cost.get(k, 0.0) + v
+        for k, v in (r.get("byApiReq") or {}).items():
+            api_req[k] = api_req.get(k, 0) + v
+    cache = []
+    for f in sorted(DATA_DIR.glob("cache_stats_*.csv")):
+        try:
+            with open(f, encoding="utf-8-sig", newline="") as fh:
+                for r in csv.DictReader(fh):
+                    cache.append({
+                        "d": r["date"], "api": r["api"],
+                        "hit": int(float(r.get("hit") or 0)),
+                        "miss": int(float(r.get("miss") or 0)),
+                        "out": int(float(r.get("output") or 0)),
+                        "req": int(float(r.get("requests") or 0)),
+                        "cost": round(float(r.get("cost") or 0), 4),
+                    })
+        except Exception:
+            pass
+    cache.sort(key=lambda x: (x["d"], x["api"]))
+
     return {
         "rows": rows,
+        "dailyCache": cache,
         "kpis": kpis(rows),
         "gift": _gift_balance(),
         "ledger": _load_ledger(),
-        "apis": [{"name": k, "tok": v, "cost": round(api_cost.get(k, 0.0), 2)}
+        "apis": [{"name": k, "tok": v, "cost": round(api_cost.get(k, 0.0), 2),
+                  "req": api_req.get(k, 0)}
                  for k, v in sorted(apis.items(), key=lambda kv: -kv[1])],
         "srcs": _data_srcs(),
         "source": data_source_label(),
@@ -550,6 +627,8 @@ TEMPLATE = r"""<!DOCTYPE html>
           padding:14px 16px 10px; }
   /* 按 API 看：表格 + 占比条 */
   table.mini { width:100%; border-collapse:collapse; font-size:12px; margin-top:2px; }
+  .tablewrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .tablewrap table { min-width:720px; }
   table.mini th, table.mini td { text-align:right; padding:5px 8px;
         border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; }
   table.mini th:first-child, table.mini td:first-child { text-align:left; font-weight:600; }
@@ -585,7 +664,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   #tip { position:fixed; z-index:9; pointer-events:none; opacity:0; background:var(--surface-1);
          color:var(--text-primary); border:1px solid var(--border); border-radius:10px;
          box-shadow:0 6px 22px rgba(0,0,0,.16); padding:9px 11px; font-size:12px;
-         min-width:200px; transition:opacity .09s linear; }
+         min-width:200px; max-width:calc(100vw - 24px); transition:opacity .09s linear; }
   #tip .day { font-size:12px; font-weight:650; margin-bottom:6px; }
   #tip .row { display:flex; align-items:center; gap:8px; margin-top:3px; }
   #tip .row .k { flex:1; color:var(--text-secondary); }
@@ -671,6 +750,9 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="value" id="k-cost"></div></div>
     <div class="tile"><div class="label">请求数</div><div class="value" id="k-req"></div></div>
     <div class="tile"><div class="label">平均每 1 元</div><div class="value" id="k-py"></div></div>
+    <div class="tile"><div class="label">缓存命中率（全部历史）</div>
+      <div class="value" id="k-cache"></div>
+      <div class="sub" id="k-cache-note"></div></div>
   </div>
   <div class="kpis sel">
     <div class="hero"><div class="label">当前所选（时间范围 + 勾选）</div><div class="value" id="s-tok"></div></div>
@@ -692,7 +774,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <span>赠送余额 ¥</span>
       <input type="number" id="giftVal" min="0" step="0.01" value="0"
              style="width:110px" placeholder="0.00">
-      <span style="opacity:.75">（默认 0 = 和上面完全一样）</span>
+      <span style="opacity:.75">（默认自动填赠送总额，改过会记住）</span>
     </div>
     <div class="giftkpi" id="giftKpi"></div>
   </div>
@@ -700,7 +782,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div class="card">
     <h2>用量全景 · 柱 + 五条曲线（每条可单独开关）</h2>
     <div class="note">
-      柱 = 当天 token（下紫 = flash 便宜、上橙 = v4-pro 贵）；曲线 = 花费 / 当天每元 token /
+      柱 = 当天/当月 token（下紫 = flash 便宜、上橙 = v4-pro 贵）；曲线 = 花费 / 当天(当月)每元 token /
       累计每元 token / 增长（累计的日增量，零线上方为正）。
       <b>纵轴 0~125%</b>：每条按自己的满格缩放到 100%，上面留 25% 给标注；真实数字都写在点上。
       增长那条：最高那天 100%、最低那天 0%，**零线自动落在 0 实际的位置上**（上方为正）。
@@ -714,6 +796,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <span class="chip" data-p="m3">最近 3 个月</span>
       <span class="chip" data-p="m6">最近半年</span>
       <span class="chip" data-p="m12">最近一年</span>
+      <span class="chip" data-p="m36">最近 3 年</span>
       <span class="chip" data-p="thisYear">今年</span>
       <span style="opacity:.8">（只改**显示**哪一段；累计每元和增长一直是按全部历史算的）</span>
     </div>
@@ -727,14 +810,44 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <details>
     <summary>数据表（和图上一样）</summary>
+    <div class="tablewrap">
     <table id="tbl"><thead><tr>
       <th>日期</th><th>flash token</th><th>v4-pro token</th><th>合计 token</th>
-      <th>请求数</th><th>花费 (元)</th><th>当天每元 token</th><th>累计每元 token</th>
-      <th>增长（对昨天）</th><th>元 / 百万 token</th>
+      <th>请求数</th><th>花费 (元)</th><th id="th-per">当天每元 token</th><th>累计每元 token</th>
+      <th id="th-delta">增长（对昨天）</th><th>token / 元</th><th>元 / 百万 token</th>
     </tr></thead><tbody></tbody></table>
+    </div>
   </details>
 
-  <div class="foot">
+  <div class="card" id="keyCard">
+  <h2>按 API Key 汇总（全部历史）</h2>
+  <div class="note" id="keyNote"></div>
+  <div class="tablewrap">
+  <table class="mini" id="keyTable">
+    <thead><tr><th>Key</th><th>token</th><th>花费</th><th>请求</th><th>每元 token</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</div>
+
+  <div class="card" id="cacheCard">
+  <h2>每日明细（按 Key）</h2>
+  <div class="note">
+    <label>日期 <input type="date" id="cacheDate"></label>
+    <span id="cacheHint"></span>
+  </div>
+  <div class="tablewrap">
+  <table class="mini" id="cacheTable">
+    <thead><tr>
+      <th>Key</th><th>合计 token</th><th>缓存命中</th><th>缓存未命中</th>
+      <th>输出</th><th>请求</th><th>花费</th><th>命中率</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</div>
+
+<div class="foot">
     <b>数据来源</b>：DeepSeek 平台导出的两份 CSV（amount + cost）逐日汇总，现读现算。<br>
     <b>为什么纵轴是百分比</b>：token、元、token/元 量级差上百倍，硬画一根真实轴等于凭空造"相关性"；
     每条按自己的最大值归一化，量级看数字标注和表格。<br>
@@ -774,13 +887,13 @@ const SERIES = [
   { key:"cheap",  kind:"bar",  color:"var(--cheap)",  label:"flash token（便宜）" },
   { key:"pricey", kind:"bar",  color:"var(--pricey)", label:"v4-pro token（贵）" },
   { key:"cost",   kind:"line", color:"var(--money)",  label:"花费（元）",
-    get:d => d.cost > 0 ? d.cost : null, max:() => Math.max(...DATA.map(d => d.cost)),
+    get:d => d.cost > 0 ? d.cost : null, max:() => Math.max(...scanRows().map(d => d.cost)),
     labelFmt:v => "¥" + v.toFixed(2), all:true, prefer:"above" },
   { key:"daily",  kind:"line", color:"var(--daily)",  label:"当天每元 token",
-    get:d => d.perYuan, max:() => Math.max(...DATA.map(d => d.perYuan || 0)),
+    get:d => d.perYuan, max:() => Math.max(...scanRows().map(d => d.perYuan || 0)),
     labelFmt:cnc, all:true, prefer:"below" },
   { key:"cum",    kind:"line", color:"var(--cum)",    label:"累计每元 token",
-    get:d => d.cum, max:() => Math.max(...DATA.map(d => d.cum || 0)),
+    get:d => d.cum, max:() => Math.max(...scanRows().map(d => d.cum || 0)),
     labelFmt:cnc, all:true, prefer:"above" },
   { key:"delta",  kind:"line", color:"var(--delta)",  label:"增长（累计的日增量）",
     get:d => d.delta, labelFmt:signed, all:true, zeroLine:true, prefer:"above" },
@@ -788,7 +901,7 @@ const SERIES = [
 const ON = {};
 // 默认开「花费」和「当天每元」；累计每元、增长默认关着（用户 2026-10-20）
 SERIES.forEach(s => ON[s.key] = (s.key === "cost" || s.key === "daily"));
-SERIES[5].max = () => Math.max(...DATA.map(d => Math.abs(d.delta || 0)));
+SERIES[5].max = () => Math.max(...scanRows().map(d => Math.abs(d.delta || 0)));
 
 // ── 布局 ────────────────────────────────────────────────────
 const W = 1400, ML = 70, MR = 24, TOP = 30, PLOT_H = 380, AXIS_PCT = 125;
@@ -827,8 +940,65 @@ function seriesPct(s, v) {
 let VIEW = [], FROM = "", TO = "", PRESET = "all", SVG_W = 1400, GIFT = null, BAL = null;
 let DEFAULT_LEDGER = null;
 
+// 2026-10-28：超过 3 个月的区间按**月**显示（不然一年 365 根柱子没法看）
+let MONTHLY = [];
+const MONTHLY_PRESETS = ["m3", "m6", "m12", "m36", "thisYear"];
+function isMonthly() { return MONTHLY_PRESETS.indexOf(PRESET) >= 0; }
+function unitWord() { return isMonthly() ? "月" : "天"; }
+function prevWord() { return isMonthly() ? "对上月" : "对昨天"; }
+function scanRows() { return isMonthly() && MONTHLY.length ? MONTHLY : DATA; }
+function numAdd(dst, srcObj) {
+  for (const [k, v] of Object.entries(srcObj || {})) dst[k] = (dst[k] || 0) + Number(v || 0);
+  return dst;
+}
+function toMonthly(rows) {
+  const m = {};
+  rows.forEach(r => {
+    const k = String(r.d).slice(0, 7);
+    if (!m[k]) {
+      m[k] = { d: k, cheap: 0, pricey: 0, total: 0, req: 0, cost: 0,
+               byApi: {}, byApiReq: {}, byApiCost: {}, byApiModel: {} };
+    }
+    const o = m[k];
+    o.cheap += r.cheap || 0;
+    o.pricey += r.pricey || 0;
+    o.total += r.total || 0;
+    o.req += r.req || 0;
+    o.cost += r.cost || 0;
+    numAdd(o.byApi, r.byApi);
+    numAdd(o.byApiReq, r.byApiReq);
+    numAdd(o.byApiCost, r.byApiCost);
+    for (const [api, models] of Object.entries(r.byApiModel || {})) {
+      o.byApiModel[api] = o.byApiModel[api] || {};
+      numAdd(o.byApiModel[api], models);
+    }
+  });
+  const arr = Object.values(m).sort((a, b) => (a.d < b.d ? -1 : 1));
+  let tokCum = 0, costCum = 0, prev = null;
+  arr.forEach(o => {
+    tokCum += o.total; costCum += o.cost;
+    o.perYuan = o.cost > 0 && o.total > 0 ? Math.round(o.total / o.cost) : null;
+    o.cum = costCum > 0 ? Math.round(tokCum / costCum) : null;
+    o.delta = (o.cum !== null && prev !== null) ? o.cum - prev : null;
+    prev = o.cum !== null ? o.cum : prev;
+  });
+  return arr;
+}
+function baseRows() { return (isMonthly() && MONTHLY.length) ? MONTHLY : DATA; }
+function inRange(d) {
+  if (!FROM && !TO) return true;
+  const k = String(d);
+  if (isMonthly()) {
+    const kk = k.slice(0, 7);
+    const f = FROM ? FROM.slice(0, 7) : "";
+    const t = TO ? TO.slice(0, 7) : "";
+    return (!f || kk >= f) && (!t || kk <= t);
+  }
+  return (!FROM || k >= FROM) && (!TO || k <= TO);
+}
+
 function view() {
-  return DATA.filter(d => (!FROM || d.d >= FROM) && (!TO || d.d <= TO));
+  return baseRows().filter(d => inRange(d.d));
 }
 const inView = s => Math.max(...VIEW.map(d => {
   const v = s.get ? s.get(d) : 0;
@@ -944,7 +1114,7 @@ function render() {
   D.forEach((d, i) => {
     if (i % step !== 0 && i !== N - 1) return;
     const t6 = el("text", { class: "ink", x: CX(i), y: BOTTOM + 18, "text-anchor": "middle" });
-    t6.textContent = d.d.slice(5).replace("-", "/");
+    t6.textContent = isMonthly() ? d.d.slice(2).replace("-", "/") : d.d.slice(5).replace("-", "/");
   });
 
   // ⚠️⚠️ 命中层和十字线**必须每次重绘都重建**（原来是模块级建一次，
@@ -983,7 +1153,10 @@ function buildLegend() {
     i.className = s.kind === "line" ? "line" : "";
     i.style.background = s.color;
     const sp = document.createElement("span");
-    sp.textContent = s.label;
+    let lab = s.label;
+    if (s.key === "daily") lab = "当" + unitWord() + "每元 token";
+    if (s.key === "delta") lab = "增长（累计的" + (isMonthly() ? "月" : "日") + "增量）";
+    sp.textContent = lab;
     lb.appendChild(cb); lb.appendChild(i); lb.appendChild(sp);
     box.appendChild(lb);
   });
@@ -1045,22 +1218,40 @@ function show(i, cx, cy) {
   row(tip, "合计 token", fmtInt(d.total), null);
   row(tip, "请求数", fmtInt(d.req), null);
   row(tip, "花费", d.cost > 0 ? money(d.cost) : "—", "var(--money)");
+  const _ck = isMonthly() ? String(d.d).slice(0, 7) : d.d;
+  const _cc = isMonthly() ? CACHE_MONTH[_ck] : CACHE_DAY[_ck];
+  if (_cc) {
+    const _den = (_cc.hit || 0) + (_cc.miss || 0);
+    row(tip, "缓存命中", fmtInt(_cc.hit || 0), null);
+    row(tip, "缓存未命中", fmtInt(_cc.miss || 0), null);
+    row(tip, "输出 token", fmtInt(_cc.out || 0), null);
+    row(tip, "命中率", _den > 0 ? ((_cc.hit || 0) / _den * 100).toFixed(1) + "%" : "—", null);
+  }
   const hr = document.createElement("hr"); tip.appendChild(hr);
-  row(tip, "当天每元 token", d.perYuan ? fmtInt(d.perYuan) : "—", "var(--daily)");
+  row(tip, "当" + unitWord() + "每元 token", d.perYuan ? fmtInt(d.perYuan) : "—", "var(--daily)");
   row(tip, "累计每元 token", d.cum ? fmtInt(d.cum) : "—", "var(--cum)");
-  row(tip, "增长（对昨天）", d.delta === null || d.delta === undefined ? "—"
+  row(tip, "增长（" + prevWord() + "）", d.delta === null || d.delta === undefined ? "—"
       : signed(d.delta) + "  token/元", "var(--delta)");
-  row(tip, "合每百万 token", d.perYuan ? "¥" + perMillion(d.perYuan).toFixed(3) : "—", null);
+  row(tip, "token / 元", d.perYuan ? fmtInt(d.perYuan) : "—", null);
+  row(tip, "元 / 百万 token", d.perYuan ? "¥" + perMillion(d.perYuan).toFixed(3) : "—", null);
   tip.style.opacity = 1;
   const bw2 = tip.offsetWidth, bh2 = tip.offsetHeight;
   let tx, ty;
+  const M = 8;
   if (cx == null) {
     const box = SVG.getBoundingClientRect();
     tx = box.left + (CX(i) / SVG_W) * box.width + 14; ty = box.top + box.height + 8;
-  } else { tx = cx + 16; ty = cy + 16; }
-  tx = Math.min(tx, innerWidth - bw2 - 10); ty = Math.min(ty, innerHeight - bh2 - 10);
-  tip.style.left = Math.max(8, tx) + "px";
-  tip.style.top = Math.max(8, ty) + "px";
+  } else {
+    // 像桌面右键菜单：优先右边，放不下就翻到左边；下面放不下就翻到上面
+    tx = cx + 16;
+    if (tx + bw2 > innerWidth - M) tx = cx - bw2 - 16;
+    ty = cy + 16;
+    if (ty + bh2 > innerHeight - M) ty = cy - bh2 - 16;
+  }
+  tx = Math.max(M, Math.min(tx, innerWidth - bw2 - M));
+  ty = Math.max(M, Math.min(ty, innerHeight - bh2 - M));
+  tip.style.left = tx + "px";
+  tip.style.top = ty + "px";
 }
 function hide() {
   tip.style.opacity = 0; cross.style.opacity = 0;
@@ -1070,6 +1261,10 @@ function hide() {
 
 // ── 数据表 / KPI / 头部 ─────────────────────────────────────
 function table() {
+  const thPer = document.getElementById("th-per");
+  if (thPer) thPer.textContent = "当" + unitWord() + "每元 token";
+  const thDelta = document.getElementById("th-delta");
+  if (thDelta) thDelta.textContent = "增长（" + prevWord() + "）";
   const tb = document.querySelector("#tbl tbody");
   tb.textContent = "";
   curRows().forEach(d => {
@@ -1079,6 +1274,7 @@ function table() {
                    d.cum ? fmtInt(d.cum) : "—",
                    (d.delta === null || d.delta === undefined) ? "—"
                         : (d.delta > 0 ? "+" : d.delta < 0 ? "−" : "") + fmtInt(Math.abs(d.delta)),
+                   d.perYuan ? fmtInt(d.perYuan) : "—",
                    d.perYuan ? perMillion(d.perYuan).toFixed(3) : "—"];
     const tr = document.createElement("tr");
     cells.forEach((c, i) => {
@@ -1096,8 +1292,8 @@ const MODEL_OFF = new Set(); // 被点掉的模型
 const API_COLORS = ["#6250d6", "#eb6834", "#eda100", "#e87ba4", "#1b8989", "#7a7a7a"];
 let APIS = [];                       // [{name, tok}] 来自后端
 function selectionRows() {            // 全部数据，按"排除了哪些 API / 模型"过滤
-  if (!API_OFF.size && !MODEL_OFF.size) return DATA;
-  return DATA.map(r => {
+  if (!API_OFF.size && !MODEL_OFF.size) return baseRows();
+  return baseRows().map(r => {
     const keep = {}, byApiCost = {}, byApiReq = {};
     let c = 0, q = 0;
     for (const [api, perModel] of Object.entries(r.byApiModel || {})) {
@@ -1123,7 +1319,7 @@ function selectionRows() {            // 全部数据，按"排除了哪些 API 
 }
 function curRows() {
   // 累计每元 / 增长 一直按**全部历史**算（2026-10-20 用户：还是沿用历史口径）
-  return selectionRows().filter(r => (!FROM || r.d >= FROM) && (!TO || r.d <= TO));
+  return selectionRows().filter(r => inRange(r.d));
 }
 // 2026-10-20 用户：把"按 API 看"并进图下的图例里 —— 默认全选 = 总量，
 // 点掉一个就把这个 API 的用量从所有数字里减掉；当前这段没调用过的 API 不显示。
@@ -1221,6 +1417,36 @@ function drawGift() {
 }
 
 const LEDGER_LS = "ds_ledger";
+const GIFT_LS = "ds_gift";
+function giftDefault() {
+  try { return Math.round(sumArr(LEDGER.grants) * 100) / 100; } catch (e) { return 0; }
+}
+function initGift() {
+  const onEl = document.getElementById("giftOn");
+  const valEl = document.getElementById("giftVal");
+  if (!onEl || !valEl) return;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(GIFT_LS) || "null"); } catch (e) {}
+  if (saved && typeof saved.on === "boolean") {
+    onEl.checked = !!saved.on;
+    if (saved.val !== undefined && saved.val !== null) valEl.value = saved.val;
+  } else {
+    const d = giftDefault();
+    valEl.value = d > 0 ? d.toFixed(2) : "0";
+    onEl.checked = d > 0;      // 有赠送额就默认勾上，省得每次手输
+  }
+  drawGift();
+}
+function saveGift() {
+  const onEl = document.getElementById("giftOn");
+  const valEl = document.getElementById("giftVal");
+  if (!onEl || !valEl) return;
+  try {
+    localStorage.setItem(GIFT_LS, JSON.stringify({
+      on: !!onEl.checked, val: Number(valEl.value || 0)
+    }));
+  } catch (e) {}
+}
 let LEDGER = { topups: [], grants: [] };
 function loadLedger() {
   try {
@@ -1306,7 +1532,9 @@ function head() {
   const aPy = aCost > 0 ? Math.round(aTok / aCost) : 0;
   const narrowed = !!(FROM || TO);
   document.getElementById("range").textContent = narrowed
-    ? `显示 ${rows[0].d} → ${rows[rows.length - 1].d} · ${rows.length} 天`
+    ? (isMonthly()
+        ? `显示 ${rows[0].d} → ${rows[rows.length - 1].d} · ${rows.length} 个月（按月汇总）`
+        : `显示 ${rows[0].d} → ${rows[rows.length - 1].d} · ${rows.length} 天`)
       + (BUILT ? ` · 数据读到 ${BUILT}` : "")
     : `${K.from} → ${K.to} · 共 ${K.days} 天（有用量 ${K.active} 天，空白 ${K.empty} 天）`
       + (BUILT ? ` · 数据读到 ${BUILT}` : "");
@@ -1338,6 +1566,17 @@ function head() {
     document.getElementById("s-cost").textContent = money(cost);
     document.getElementById("s-req").textContent = fmtInt(req);
     document.getElementById("s-py").innerHTML = cn(py) + " <small>token</small>";
+  let cHit = 0, cMiss = 0, cOut = 0;
+  for (const c of CACHE) { cHit += c.hit || 0; cMiss += c.miss || 0; cOut += c.out || 0; }
+  const cDen = cHit + cMiss;
+  const kCache = document.getElementById("k-cache");
+  if (kCache) kCache.textContent = cDen > 0 ? (cHit / cDen * 100).toFixed(1) + "%" : "—";
+  const kCacheNote = document.getElementById("k-cache-note");
+  if (kCacheNote) {
+    kCacheNote.textContent = cDen > 0
+      ? "命中 " + fmtInt(cHit) + " ｜ 未命中 " + fmtInt(cMiss) + " ｜ 输出 " + fmtInt(cOut)
+      : "";
+  }
     document.getElementById("k-tok-note").textContent =
       (aTok ? ((tok / aTok) * 100).toFixed(1) + "% 被选中" : "");
   }
@@ -1348,9 +1587,101 @@ function head() {
     ? `数据来源：${SOURCE}` + (narrowed ? "（第一行是**全部历史**，第二行才是当前这段时间 + 勾选）" : "")
     : "";
 }
+function keyTableRender() {
+  const tb = document.querySelector("#keyTable tbody");
+  if (!tb) return;
+  const rows = (APIS || []).slice();
+  let tTok = 0, tCost = 0, tReq = 0;
+  tb.innerHTML = "";
+  rows.forEach(a => {
+    const tok = Number(a.tok || 0), cost = Number(a.cost || 0), req = Number(a.req || 0);
+    tTok += tok; tCost += cost; tReq += req;
+    const tr = document.createElement("tr");
+    const per = cost > 0 ? tok / cost : 0;
+    tr.innerHTML = "<td style='text-align:left'>" + (a.name || "") + "</td>" +
+      "<td>" + fmtInt(tok) + "</td>" +
+      "<td>" + (cost > 0 ? money(cost) : "—") + "</td>" +
+      "<td>" + (req ? fmtInt(req) : "—") + "</td>" +
+      "<td>" + (per ? fmtInt(per) : "—") + "</td>";
+    tb.appendChild(tr);
+  });
+  const tr = document.createElement("tr");
+  tr.innerHTML = "<td style='text-align:left;font-weight:600'>合计</td>" +
+    "<td style='font-weight:600'>" + fmtInt(tTok) + "</td>" +
+    "<td style='font-weight:600'>" + money(tCost) + "</td>" +
+    "<td style='font-weight:600'>" + fmtInt(tReq) + "</td>" +
+    "<td style='font-weight:600'>" + (tCost > 0 ? fmtInt(tTok / tCost) : "—") + "</td>";
+  tb.appendChild(tr);
+  const note = document.getElementById("keyNote");
+  if (note) note.textContent = "花费 = 每行 price × amount 逐行相加（与 cost CSV 日汇总差几分钱是单价四舍五入）";
+}
+
+let CACHE = [], CACHE_DAY = {}, CACHE_MONTH = {};
+function cacheDailyRender(day) {
+  const tb = document.querySelector("#cacheTable tbody");
+  if (!tb) return;
+  const input = document.getElementById("cacheDate");
+  if (!day) {
+    day = (input && input.value) || "";
+    if (!day && CACHE.length) day = CACHE[CACHE.length - 1].d;
+    if (!day) day = DATA.length ? DATA[DATA.length - 1].d : "";
+  }
+  if (input && day) {
+    input.value = day;
+    if (CACHE.length) { input.min = CACHE[0].d; input.max = CACHE[CACHE.length - 1].d; }
+  }
+  const rows = (CACHE || []).filter(r => r.d === day);
+  tb.innerHTML = "";
+  let th = 0, tm = 0, to = 0, tr = 0, tc = 0;
+  for (const a of rows) {
+    th += a.hit; tm += a.miss; to += a.out; tr += a.req; tc += a.cost;
+    const denom = a.hit + a.miss;
+    const rate = denom > 0 ? (a.hit / denom * 100).toFixed(1) + "%" : "—";
+    const row = document.createElement("tr");
+    row.innerHTML = "<td style='text-align:left'>" + (a.api || "") + "</td>" +
+      "<td>" + fmtInt(a.hit + a.miss + a.out) + "</td>" +
+      "<td>" + fmtInt(a.hit) + "</td>" +
+      "<td>" + fmtInt(a.miss) + "</td>" +
+      "<td>" + fmtInt(a.out) + "</td>" +
+      "<td>" + (a.req ? fmtInt(a.req) : "—") + "</td>" +
+      "<td>" + (a.cost > 0 ? money(a.cost) : "—") + "</td>" +
+      "<td>" + rate + "</td>";
+    tb.appendChild(row);
+  }
+  if (!rows.length) {
+    tb.innerHTML = "<tr><td colspan='8'>这天没有记录</td></tr>";
+  } else {
+    const denom = th + tm;
+    const row = document.createElement("tr");
+    row.innerHTML = "<td style='text-align:left;font-weight:600'>合计</td>" +
+      "<td style='font-weight:600'>" + fmtInt(th + tm + to) + "</td>" +
+      "<td style='font-weight:600'>" + fmtInt(th) + "</td>" +
+      "<td style='font-weight:600'>" + fmtInt(tm) + "</td>" +
+      "<td style='font-weight:600'>" + fmtInt(to) + "</td>" +
+      "<td style='font-weight:600'>" + (tr ? fmtInt(tr) : "—") + "</td>" +
+      "<td style='font-weight:600'>" + (tc > 0 ? money(tc) : "—") + "</td>" +
+      "<td style='font-weight:600'>" + (denom > 0 ? (th / denom * 100).toFixed(1) + "%" : "—") + "</td>";
+    tb.appendChild(row);
+  }
+  const hint = document.getElementById("cacheHint");
+  if (hint) hint.textContent = rows.length ? (day + " · " + rows.length + " 个 key") : (day || "");
+}
+
 function apply(p) {
-  DATA = p.rows || []; K = p.kpis || {}; SOURCE = p.source || ""; BUILT = p.built || "";
+  DATA = p.rows || []; K = p.kpis || {};
+  MONTHLY = toMonthly(DATA); SOURCE = p.source || ""; BUILT = p.built || "";
   APIS = p.apis || []; GIFT = (p.gift === undefined ? null : p.gift);
+  CACHE = p.dailyCache || [];
+  CACHE_DAY = {}; CACHE_MONTH = {};
+  for (const c of CACHE) {
+    const dd = CACHE_DAY[c.d] || (CACHE_DAY[c.d] = { hit: 0, miss: 0, out: 0, req: 0, cost: 0 });
+    dd.hit += c.hit || 0; dd.miss += c.miss || 0; dd.out += c.out || 0;
+    dd.req += c.req || 0; dd.cost += c.cost || 0;
+    const mk = String(c.d).slice(0, 7);
+    const mm = CACHE_MONTH[mk] || (CACHE_MONTH[mk] = { hit: 0, miss: 0, out: 0, req: 0, cost: 0 });
+    mm.hit += c.hit || 0; mm.miss += c.miss || 0; mm.out += c.out || 0;
+    mm.req += c.req || 0; mm.cost += c.cost || 0;
+  }
   DEFAULT_LEDGER = p.ledger || null;
   const f = document.getElementById("from"), to = document.getElementById("to");
   if (DATA.length) {
@@ -1360,10 +1691,14 @@ function apply(p) {
   FROM = ""; TO = ""; PRESET = "m30";
   f.value = DATA.length ? DATA[0].d : "";
   to.value = DATA.length ? DATA[DATA.length - 1].d : "";
-  render(); head(); table();
+  render(); head(); table(); keyTableRender(); buildLegend();
+  cacheDailyRender();
+  const _cd = document.getElementById("cacheDate");
+  if (_cd) _cd.addEventListener("change", () => cacheDailyRender(_cd.value));
   // 默认落"最近 30 天"（用户 2026-10-13："全部感觉没必要留着，以后太多了会膨胀"）——
   //    放在首屏渲染之后按一下，省得改一堆初始化顺序。
   loadLedger();
+  initGift();
   const setBtn = document.getElementById("settingsBtn");
   const modal = document.getElementById("ledgerModal");
   if (setBtn && modal) setBtn.onclick = () => { modal.style.display = "flex"; renderLedger(); };
@@ -1373,14 +1708,16 @@ function apply(p) {
   const bindAdd = (inputId, kind) => {
     const inp = document.getElementById(inputId);
     if (!inp) return;
-    inp.onkeydown = (ev) => {
-      if (ev.key !== "Enter") return;
+    const add = () => {
       const v = Number(inp.value);
       if (!(v > 0)) return;
       LEDGER[kind].push(v);
       inp.value = "";
       saveLedger(); head();
     };
+    inp.onkeydown = (ev) => { if (ev.key === "Enter") add(); };
+    const btn = document.getElementById(inputId + "Btn");
+    if (btn) btn.onclick = add;      // 手机上没有回车键，用按钮保存
   };
   bindAdd("topupAdd", "topups");
   bindAdd("grantAdd", "grants");
@@ -1406,6 +1743,7 @@ function presetRange(kind) {
     case "m3":  a = isoD(new Date(y, m - 2, 1)); b = last; break;
     case "m6":  a = isoD(new Date(y, m - 5, 1)); b = last; break;
     case "m12": a = isoD(new Date(y, m - 11, 1)); b = last; break;
+    case "m36": a = isoD(new Date(y, m - 35, 1)); b = last; break;
     case "thisYear": a = `${y}-01-01`; b = last; break;
     default: return ["", ""];
   }
@@ -1436,7 +1774,10 @@ document.querySelectorAll("#filters .chip").forEach(c =>
 // 赠送余额那两个控件：勾/改都立刻重算（纯前端，不动上面任何曲线）
 ["giftOn", "giftVal"].forEach(id => {
   const el = document.getElementById(id);
-  if (el) { el.addEventListener("input", drawGift); el.addEventListener("change", drawGift); }
+  if (!el) return;
+  const upd = () => { saveGift(); drawGift(); };
+  el.addEventListener("input", upd);
+  el.addEventListener("change", upd);
 });
 let rzTimer = null;
 window.addEventListener("resize", () => {           // 窗口变了 → 间距/是否要滚 重算
@@ -1645,12 +1986,18 @@ load(false);
     <div class="ledger-sec">
       <div class="ledger-head">充值<span id="topupSum" class="gift"></span></div>
       <div id="topupList" class="ledger-list"></div>
-      <input id="topupAdd" type="number" placeholder="输入金额，回车添加">
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <input id="topupAdd" type="number" placeholder="输入金额，回车或点添加" style="flex:1">
+        <button id="topupAddBtn" class="ghost">添加</button>
+      </div>
     </div>
     <div class="ledger-sec">
       <div class="ledger-head">赠送<span id="grantSum" class="gift"></span></div>
       <div id="grantList" class="ledger-list"></div>
-      <input id="grantAdd" type="number" placeholder="输入金额，回车添加">
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <input id="grantAdd" type="number" placeholder="输入金额，回车或点添加" style="flex:1">
+        <button id="grantAddBtn" class="ghost">添加</button>
+      </div>
     </div>
     <div class="modal-foot">
       <span id="ledgerHint" style="opacity:.75;font-size:12px"></span>

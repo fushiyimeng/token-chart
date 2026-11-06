@@ -1,4 +1,10 @@
 *.exe
 __pycache__/
+*.pyc
 token-usage.html
 usage_data_*
+token.txt
+balance.key
+api_keys.json
+state.json
+*.log

@@ -50,3 +50,28 @@ python -m PyInstaller --onefile --name token-chart build.py
 ```
 
 或直接双击 `打包exe.bat`。
+
+## 网页服务（可选）
+
+```bash
+TOKEN_CHART_DIR=$PWD TOKEN_CHART_PORT=6186 python3 server.py
+```
+
+- `GET /` 页面
+- `GET /data.json` 当前数据
+- `POST /refresh` 触发 `update.py`（自己放一个更新脚本即可）
+- `POST /ledger` 保存充值/赠送记账
+
+## 更新日志
+
+### v1.2.0
+- 新增「按 API Key 汇总」和「每日明细（按 Key）」表，手机端可横向滑动
+- 新增缓存命中率、token / 元、元 / 百万 token 三个指标（表格 + 浮窗）
+- 图表浮窗改为自动翻边：右侧放不下就显示在左侧
+- 充值/赠送输入框增加「添加」按钮，手机端不再依赖回车键
+- 新增 `server.py` 网页服务：页面、`data.json`、刷新按钮、记账接口
+- 生成脚本去掉写死路径，数据目录固定为脚本旁的 `data/`
+
+### v1.1.0
+- 单文件 HTML，时间范围/模型/API 可勾选
+- 充值与赠送记账
